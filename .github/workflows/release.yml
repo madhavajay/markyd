@@ -1,0 +1,110 @@
+name: Release
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag (e.g. v0.1.0)"
+        required: true
+
+jobs:
+  build-and-release:
+    runs-on: macos-latest
+    defaults:
+      run:
+        working-directory: Markyd
+    env:
+      APP_IDENTITY: "Developer ID Application: Peter Steinberger (Y5PE65HELJ)"
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Determine version
+        id: version
+        run: |
+          if [[ "${{ github.event_name }}" == "release" ]]; then
+            TAG="${{ github.event.release.tag_name }}"
+          else
+            TAG="${{ github.event.inputs.tag }}"
+          fi
+          VERSION="${TAG#v}"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Build release binary
+        run: swift build -c release --arch arm64
+
+      - name: Package app bundle
+        run: ./Scripts/package_app.sh release
+
+      - name: Sign app
+        env:
+          APP_STORE_CONNECT_API_KEY_P8: ${{ secrets.APP_STORE_CONNECT_API_KEY_P8 }}
+          APP_STORE_CONNECT_KEY_ID: ${{ secrets.APP_STORE_CONNECT_KEY_ID }}
+          APP_STORE_CONNECT_ISSUER_ID: ${{ secrets.APP_STORE_CONNECT_ISSUER_ID }}
+        run: |
+          echo "$APP_STORE_CONNECT_API_KEY_P8" | sed 's/\\n/\n/g' > /tmp/markyd-api-key.p8
+          trap 'rm -f /tmp/markyd-api-key.p8' EXIT
+
+          codesign --force --deep --options runtime --timestamp \
+            --sign "$APP_IDENTITY" Markyd.app
+
+      - name: Notarize app
+        env:
+          APP_STORE_CONNECT_API_KEY_P8: ${{ secrets.APP_STORE_CONNECT_API_KEY_P8 }}
+          APP_STORE_CONNECT_KEY_ID: ${{ secrets.APP_STORE_CONNECT_KEY_ID }}
+          APP_STORE_CONNECT_ISSUER_ID: ${{ secrets.APP_STORE_CONNECT_ISSUER_ID }}
+        run: |
+          echo "$APP_STORE_CONNECT_API_KEY_P8" | sed 's/\\n/\n/g' > /tmp/markyd-api-key.p8
+          trap 'rm -f /tmp/markyd-api-key.p8 /tmp/MarkydNotarize.zip' EXIT
+
+          /usr/bin/ditto -c -k --keepParent --sequesterRsrc Markyd.app /tmp/MarkydNotarize.zip
+
+          xcrun notarytool submit /tmp/MarkydNotarize.zip \
+            --key /tmp/markyd-api-key.p8 \
+            --key-id "$APP_STORE_CONNECT_KEY_ID" \
+            --issuer "$APP_STORE_CONNECT_ISSUER_ID" \
+            --wait
+
+          xcrun stapler staple Markyd.app
+
+      - name: Package release zip
+        run: |
+          VERSION="${{ steps.version.outputs.version }}"
+          /usr/bin/ditto -c -k --keepParent --sequesterRsrc Markyd.app "Markyd-${VERSION}.zip"
+
+      - name: Package dSYM
+        run: |
+          VERSION="${{ steps.version.outputs.version }}"
+          DSYM_PATH=".build/arm64-apple-macosx/release/Markyd.dSYM"
+          if [[ -d "$DSYM_PATH" ]]; then
+            /usr/bin/ditto -c -k --keepParent "$DSYM_PATH" "Markyd-${VERSION}.dSYM.zip"
+          fi
+
+      - name: Verify code signature
+        run: |
+          spctl -a -t exec -vv Markyd.app
+          codesign --verify --deep --strict --verbose Markyd.app
+          stapler validate Markyd.app
+
+      - name: Upload to GitHub Release
+        if: github.event_name == 'release'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          VERSION="${{ steps.version.outputs.version }}"
+          TAG="${{ steps.version.outputs.tag }}"
+          gh release upload "$TAG" \
+            "Markyd-${VERSION}.zip" \
+            "Markyd-${VERSION}.dSYM.zip" \
+            --clobber
+
+      - name: Upload artifact (manual run)
+        if: github.event_name == 'workflow_dispatch'
+        uses: actions/upload-artifact@v4
+        with:
+          name: Markyd-${{ steps.version.outputs.version }}
+          path: |
+            Markyd/Markyd-${{ steps.version.outputs.version }}.zip
+            Markyd/Markyd-${{ steps.version.outputs.version }}.dSYM.zip
